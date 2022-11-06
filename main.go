@@ -6,32 +6,22 @@ package main
 import (
 	"flag"
 	"fmt"
+	"github.com/pkg/sftp"
+	"golang.org/x/crypto/ssh"
 	"io"
 	"io/ioutil"
 	"log"
 	"net"
-	"os"
-
-	"github.com/pkg/sftp"
-	"golang.org/x/crypto/ssh"
 )
 
 // Based on example server code from golang.org/x/crypto/ssh and server_standalone
 func main() {
 
-	var (
-		readOnly    bool
-		debugStderr bool
-	)
-
-	flag.BoolVar(&readOnly, "R", false, "read-only server")
-	flag.BoolVar(&debugStderr, "e", false, "debug to stderr")
+	username := flag.String("user", "mfc", "username to accept for sftp connections")
+	password := flag.String("pass", "mfc", "password to accept for sftp connections")
+	privateKeyFile := flag.String("key", "id_rsa", "path to private key file")
+	listen := flag.String("listen", ":2022", "where to attach listener. Supports ip:port, ip is optional or can be 0.0.0.0 or omitted to listen on all interfaces. Use 127.0.0.1 to listen on localhost only")
 	flag.Parse()
-
-	debugStream := ioutil.Discard
-	if debugStderr {
-		debugStream = os.Stderr
-	}
 
 	// An SSH server is represented by a ServerConfig, which holds
 	// certificate details and handles authentication of ServerConns.
@@ -39,15 +29,15 @@ func main() {
 		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
 			// Should use constant-time compare (or better, salt+hash) in
 			// a production setting.
-			fmt.Fprintf(debugStream, "Login: %s\n", c.User())
-			if c.User() == "testuser" && string(pass) == "tiger" {
+			log.Printf("%s: Login Request for: %s\n", c.RemoteAddr(), c.User())
+			if c.User() == *username && string(pass) == *password {
 				return nil, nil
 			}
 			return nil, fmt.Errorf("password rejected for %q", c.User())
 		},
 	}
 
-	privateBytes, err := ioutil.ReadFile("id_rsa")
+	privateBytes, err := ioutil.ReadFile(*privateKeyFile)
 	if err != nil {
 		log.Fatal("Failed to load private key", err)
 	}
@@ -61,24 +51,33 @@ func main() {
 
 	// Once a ServerConfig has been configured, connections can be
 	// accepted.
-	listener, err := net.Listen("tcp", "0.0.0.0:2022")
+	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
 		log.Fatal("failed to listen for connection", err)
 	}
-	fmt.Printf("Listening on %v\n", listener.Addr())
+	fmt.Printf("sftp server listening on %v\n", listener.Addr())
 
-	nConn, err := listener.Accept()
-	if err != nil {
-		log.Fatal("failed to accept incoming connection", err)
+	for {
+		nConn, err := listener.Accept()
+		if err != nil {
+			log.Printf("failed to accept incoming connection - %s", err)
+			continue
+		}
+
+		go handleConnectionRequest(nConn, config)
 	}
+}
+
+func handleConnectionRequest(nConn net.Conn, config *ssh.ServerConfig) {
 
 	// Before use, a handshake must be performed on the incoming
 	// net.Conn.
 	_, chans, reqs, err := ssh.NewServerConn(nConn, config)
 	if err != nil {
-		log.Fatal("failed to handshake", err)
+		log.Printf("failed to handshake - %s", err)
+		return
 	}
-	fmt.Fprintf(debugStream, "SSH server established\n")
+	log.Printf("%s: SSH login succesfull", nConn.RemoteAddr())
 
 	// The incoming Request channel must be serviced.
 	go ssh.DiscardRequests(reqs)
@@ -88,46 +87,40 @@ func main() {
 		// Channels have a type, depending on the application level
 		// protocol intended. In the case of an SFTP session, this is "subsystem"
 		// with a payload string of "<length=4>sftp"
-		fmt.Fprintf(debugStream, "Incoming channel: %s\n", newChannel.ChannelType())
+		log.Printf("%s: Incoming channel: %s\n", nConn.RemoteAddr(), newChannel.ChannelType())
 		if newChannel.ChannelType() != "session" {
-			newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
-			fmt.Fprintf(debugStream, "Unknown channel type: %s\n", newChannel.ChannelType())
+			_ = newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
+			log.Printf("%s: Unknown channel type: %s\n", nConn.RemoteAddr(), newChannel.ChannelType())
 			continue
 		}
 		channel, requests, err := newChannel.Accept()
 		if err != nil {
-			log.Fatal("could not accept channel.", err)
+			log.Printf("%s: could not accept channel - %s", nConn.RemoteAddr(), err)
+			return
 		}
-		fmt.Fprintf(debugStream, "Channel accepted\n")
+		log.Printf("%s: Channel accepted", nConn.RemoteAddr())
 
 		// Sessions have out-of-band requests such as "shell",
 		// "pty-req" and "env".  Here we handle only the
 		// "subsystem" request.
 		go func(in <-chan *ssh.Request) {
 			for req := range in {
-				fmt.Fprintf(debugStream, "Request: %v\n", req.Type)
+				log.Printf("%s: Request: %v\n", nConn.RemoteAddr(), req.Type)
 				ok := false
 				switch req.Type {
 				case "subsystem":
-					fmt.Fprintf(debugStream, "Subsystem: %s\n", req.Payload[4:])
+					log.Printf("%s: Subsystem: %s\n", nConn.RemoteAddr(), req.Payload[4:])
 					if string(req.Payload[4:]) == "sftp" {
 						ok = true
 					}
 				}
-				fmt.Fprintf(debugStream, " - accepted: %v\n", ok)
-				req.Reply(ok, nil)
+				log.Printf("%s: - accepted: %v\n", nConn.RemoteAddr(), ok)
+				_ = req.Reply(ok, nil)
 			}
 		}(requests)
 
 		serverOptions := []sftp.ServerOption{
-			sftp.WithDebug(debugStream),
-		}
-
-		if readOnly {
-			serverOptions = append(serverOptions, sftp.ReadOnly())
-			fmt.Fprintf(debugStream, "Read-only server\n")
-		} else {
-			fmt.Fprintf(debugStream, "Read write server\n")
+			//sftp.WithDebug(debugStream),
 		}
 
 		server, err := sftp.NewServer(
@@ -135,13 +128,15 @@ func main() {
 			serverOptions...,
 		)
 		if err != nil {
-			log.Fatal(err)
+			log.Printf("%: unable to create sftp server - %s", nConn.RemoteAddr(), err)
+			return
 		}
 		if err := server.Serve(); err == io.EOF {
-			server.Close()
-			log.Print("sftp client exited session.")
+			_ = server.Close()
+			log.Printf("%s: sftp client exited session.", nConn.RemoteAddr())
 		} else if err != nil {
-			log.Fatal("sftp server completed with error:", err)
+			log.Printf("%s: sftp server completed with error - %s", nConn.RemoteAddr(), err)
+			return
 		}
 	}
 }
