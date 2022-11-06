@@ -1,4 +1,4 @@
-module github.com/techplexengineer/scanner
+module github.com/techplexengineer/simple-sftp
 
 go 1.18
 
